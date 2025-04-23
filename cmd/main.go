@@ -85,8 +85,43 @@ func (c *Client) executePython(code string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Using -u flag for unbuffered output to ensure we see prompts immediately
-	cmd := exec.CommandContext(ctx, "docker", "exec", "-i", "online_compiler-python-runner-1", "python3", "-u", "/tmp/script.py")
+	// Add special print wrapper to maintain formatting
+	wrappedCode := `
+import builtins
+import sys
+
+# Create a custom print function that ensures space separation
+original_print = builtins.print
+def custom_print(*args, **kwargs):
+    # Force flush to ensure output is immediately visible
+    if 'flush' not in kwargs:
+        kwargs['flush'] = True
+    # Call the original print function
+    original_print(*args, **kwargs)
+
+builtins.print = custom_print
+
+# Now execute the actual script
+with open("/tmp/script.py") as f:
+    script = f.read()
+    exec(script)
+`
+
+	wrapperFile := fmt.Sprintf("/tmp/python-wrapper-%s.py", uuid.New().String())
+	err = os.WriteFile(wrapperFile, []byte(wrappedCode), 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write wrapper file: %v", err)
+	}
+	defer os.Remove(wrapperFile)
+
+	// Copy to container
+	wrapperCopyCmd := exec.Command("docker", "cp", wrapperFile, "online_compiler-python-runner-1:/tmp/wrapper.py")
+	if err := wrapperCopyCmd.Run(); err != nil {
+		return fmt.Errorf("failed to copy wrapper file to container: %v", err)
+	}
+
+	// Execute with the wrapper
+	cmd := exec.CommandContext(ctx, "docker", "exec", "-i", "online_compiler-python-runner-1", "python3", "-u", "/tmp/wrapper.py")
 	c.cmd = cmd
 
 	stdin, err := cmd.StdinPipe()
@@ -138,54 +173,75 @@ func (c *Client) executePython(code string) error {
 
 // Combined function to read both stdout and stderr
 func (c *Client) readOutputs(stdout, stderr io.Reader) {
-	// Use a buffered reader that reads character by character
-	stdoutReader := bufio.NewReader(stdout)
-	stderrReader := bufio.NewReader(stderr)
+	// Use line-based reading for simpler output handling
+	stdoutScanner := bufio.NewScanner(stdout)
+	stderrScanner := bufio.NewScanner(stderr)
 
 	// Channel to coordinate both readers
 	stdoutDone := make(chan struct{})
 	stderrDone := make(chan struct{})
 
+	// Process stdout
 	go func() {
+		for stdoutScanner.Scan() {
+			line := stdoutScanner.Text()
+
+			// Send the line as a message
+			c.sendMessage(line)
+
+			// Check if this line might be an input prompt
+			if strings.Contains(line, ":") || strings.Contains(line, "?") {
+				c.sendMessage("WAITING_FOR_INPUT")
+			}
+
+		}
+
+		if err := stdoutScanner.Err(); err != nil {
+			log.Println("Stdout scanner error:", err)
+		}
+
+		close(stdoutDone)
+	}()
+
+	// Process stderr
+	go func() {
+		for stderrScanner.Scan() {
+			c.sendMessage("Error: " + stderrScanner.Text())
+		}
+
+		if err := stderrScanner.Err(); err != nil {
+			log.Println("Stderr scanner error:", err)
+		}
+
+		close(stderrDone)
+	}()
+
+	// Additionally monitor for partial lines that might be input prompts
+	go func() {
+		reader := bufio.NewReader(stdout)
 		buffer := ""
+
 		for {
-			r, _, err := stdoutReader.ReadRune()
+			r, _, err := reader.ReadRune()
 			if err != nil {
 				if err != io.EOF {
-					log.Println("Stdout read error:", err)
+					log.Println("Partial line monitor error:", err)
 				}
 				break
 			}
 
 			buffer += string(r)
 
-			// When we get a newline, send the buffer as a message
-			if r == '\n' {
-				c.sendMessage(strings.TrimRight(buffer, "\r\n"))
-				buffer = ""
-			} else if strings.Contains(buffer, ": ") || strings.Contains(buffer, "?") {
-				// Possible input prompt detection
+			// If we see typical input prompt patterns without a newline
+			if (strings.Contains(buffer, ": ") || strings.Contains(buffer, "?")) &&
+				!strings.Contains(buffer, "\n") {
 				c.sendMessage(buffer)
 				c.sendMessage("WAITING_FOR_INPUT")
 				buffer = ""
+			} else if r == '\n' {
+				buffer = ""
 			}
 		}
-
-		// Send any remaining content
-		if buffer != "" {
-			c.sendMessage(buffer)
-			// If the program ended with text and no newline, it's likely waiting for input
-			c.sendMessage("WAITING_FOR_INPUT")
-		}
-		close(stdoutDone)
-	}()
-
-	go func() {
-		scanner := bufio.NewScanner(stderrReader)
-		for scanner.Scan() {
-			c.sendMessage("Error: " + scanner.Text())
-		}
-		close(stderrDone)
 	}()
 
 	// Wait for both readers to finish
